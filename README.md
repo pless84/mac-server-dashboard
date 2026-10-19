@@ -15,25 +15,25 @@ memory comes from `footprint`.
 ## Run
 
 ```bash
-python3 runner_dashboard.py        # http://0.0.0.0:8089
+python3 mac_server_dashboard.py        # http://0.0.0.0:8089
 ```
 
 The JSON behind the page is served at `/api/status`.
 
-| Env var            | Default                   |
-| ------------------ | ------------------------- |
-| `RUNNER_DASH_PORT` | `8089`                    |
-| `RUNNER_DASH_BIND` | `0.0.0.0`                 |
-| `OLLAMA_URL`       | `http://127.0.0.1:11434`  |
+| Env var         | Default                  |
+| --------------- | ------------------------ |
+| `MAC_DASH_PORT` | `8089`                   |
+| `MAC_DASH_BIND` | `0.0.0.0`                |
+| `OLLAMA_URL`    | `http://127.0.0.1:11434` |
 
 ## Install as a LaunchAgent
 
 ```bash
-mkdir -p ~/runner-dashboard
-cp runner_dashboard.py ~/runner-dashboard/
-cp dk.pless.runner-dashboard.plist ~/Library/LaunchAgents/   # adjust paths inside first
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dk.pless.runner-dashboard.plist
+mkdir -p ~/mac-server-dashboard
+cp mac_server_dashboard.py ~/mac-server-dashboard/
+cp dk.pless.mac-server-dashboard.plist ~/Library/LaunchAgents/   # adjust paths inside first
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dk.pless.mac-server-dashboard.plist
 ```
 
-To restart after an update, run `launchctl kickstart -k gui/$(id -u)/dk.pless.runner-dashboard`.
-Logs go to `~/Library/Logs/runner-dashboard.log`.
+To restart after an update, run `launchctl kickstart -k gui/$(id -u)/dk.pless.mac-server-dashboard`.
+Logs go to `~/Library/Logs/mac-server-dashboard.log`.

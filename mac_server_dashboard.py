@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only status dashboard for GitHub Actions self-hosted runners on macOS.
+"""Read-only status dashboard for a Mac home server: local LLMs and GitHub Actions runners.
 
 Discovers runners in /Users/*/actions-runner*/ (including ones running under a
 dedicated account as a LaunchDaemon), reads their launchd service state,
@@ -21,8 +21,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser("~")
-PORT = int(os.environ.get("RUNNER_DASH_PORT", "8089"))
-BIND = os.environ.get("RUNNER_DASH_BIND", "0.0.0.0")
+PORT = int(os.environ.get("MAC_DASH_PORT", "8089"))
+BIND = os.environ.get("MAC_DASH_BIND", "0.0.0.0")
 HISTORY_LIMIT = 25
 
 LOG_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\dZ): (.*)$")
@@ -213,6 +213,8 @@ def runner_status(root, procs):
         job["started"] = current["started"] if current else time.time() - worker[1]
 
     repo_url = cfg.get("gitHubUrl", "")
+    if not repo_url.startswith("https://"):  # only ever used as a link target
+        repo_url = ""
     return {
         "dir": root,
         "name": cfg.get("agentName", os.path.basename(root)),
@@ -641,5 +643,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=sampler, daemon=True).start()
-    print("Runner dashboard on http://%s:%d" % (BIND, PORT), flush=True)
+    print("Mac server dashboard on http://%s:%d" % (BIND, PORT), flush=True)
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
