@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only status dashboard for a Mac home server: local LLMs and GitHub Actions runners.
+"""Read-only status dashboard for a Mac home server: local LLMs, scheduled jobs and GitHub Actions runners.
 
 Discovers runners in /Users/*/actions-runner*/ (including ones running under a
 dedicated account as a LaunchDaemon), reads their launchd service state,
@@ -456,12 +456,206 @@ def llm_status(procs):
     return out
 
 
+# ---------------------------------------------------------------- scheduled jobs
+
+# A job counts as having missed its run when nothing has been logged this long after it was due.
+MISSED_GRACE_SECS = 30 * 60
+JOB_LOG_LINES = 5
+LOG_TS = re.compile(r"^(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)\s+(.*)$")
+
+
+def calendar_entries(spec):
+    """StartCalendarInterval as a list of dicts (launchd accepts one dict or an array)."""
+    if isinstance(spec, dict):
+        return [spec]
+    return [e for e in spec or [] if isinstance(e, dict)]
+
+
+def calendar_match_day(entry, day):
+    """Whether a calendar entry can fire on this date (launchd: Weekday 0 and 7 are Sunday)."""
+    if "Month" in entry and entry["Month"] != day.month:
+        return False
+    if "Day" in entry and entry["Day"] != day.day:
+        return False
+    if "Weekday" in entry and entry["Weekday"] % 7 != (day.weekday() + 1) % 7:
+        return False
+    return True
+
+
+def calendar_time(entries, now, forward=True, max_days=4 * 366):
+    """The next (or previous) time any entry fires, as a timestamp in local time, or None."""
+    base = datetime.fromtimestamp(now).replace(second=0, microsecond=0)
+    for offset in range(max_days + 1):
+        day = datetime.fromordinal(base.toordinal() + (offset if forward else -offset))
+        times = []
+        for e in entries:
+            if not calendar_match_day(e, day):
+                continue
+            hours = [e["Hour"]] if "Hour" in e else range(24)
+            minutes = [e["Minute"]] if "Minute" in e else range(60)
+            times += [day.replace(hour=h, minute=m).timestamp() for h in hours for m in minutes]
+        times = [t for t in times if (t > now if forward else t <= now)]
+        if times:
+            return min(times) if forward else max(times)
+    return None
+
+
+def describe_calendar(entries):
+    """A short human description, e.g. "daily 03:30" or "Mon 09:00"."""
+    days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    parts = []
+    for e in entries:
+        clock = "%02d:%02d" % (e.get("Hour", 0), e.get("Minute", 0)) if "Hour" in e else ":%02d" % e.get("Minute", 0)
+        if "Hour" not in e:
+            what = "hourly at " + clock if "Minute" in e else "every minute"
+        elif "Weekday" in e:
+            what = "%s %s" % (days[e["Weekday"] % 7], clock)
+        elif "Day" in e:
+            what = "day %d %s" % (e["Day"], clock)
+        else:
+            what = "daily " + clock
+        if "Month" in e:
+            what += " (month %d)" % e["Month"]
+        parts.append(what)
+    return ", ".join(parts)
+
+
+def job_log(path, limit=JOB_LOG_LINES):
+    """The last lines of a job's log, newest first, with their time when the line starts with one.
+
+    "key" orders lines across a job's logs: a line without a time (e.g. an error on stderr) gets
+    the time of the last timed line before it in the same file, or else the file's mtime, so a
+    fresh traceback doesn't sort below old timestamped lines."""
+    lines = []
+    last_ts = None
+    file_time = mtime(path) or 0
+    for line in tail_lines(path, max_bytes=32 * 1024):
+        if not line.strip():
+            continue
+        m = LOG_TS.match(line)
+        ts = None
+        if m:
+            try:
+                ts = time.mktime(time.strptime(m.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                ts = None
+        if ts:
+            last_ts = ts
+        lines.append({"time": ts, "key": ts or last_ts or file_time, "text": (m.group(2) if ts else line)[:240]})
+    return lines[-limit:][::-1]
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except (OSError, TypeError):
+        return None
+
+
+def scheduled_agents():
+    """This user's LaunchAgents that run on a schedule (StartCalendarInterval or StartInterval)."""
+    agents = []
+    for path in sorted(glob.glob(os.path.join(HOME, "Library", "LaunchAgents", "*.plist"))):
+        try:
+            with open(path, "rb") as f:
+                pl = plistlib.load(f)
+        except Exception:
+            continue
+        if not isinstance(pl, dict) or not pl.get("Label") or not (pl.get("StartCalendarInterval") or pl.get("StartInterval")):
+            continue
+        agents.append((path, pl))
+    return agents
+
+
+def job_status(path, pl, now):
+    label = pl["Label"]
+    svc = launchd_state(label)
+    logs = [p for p in dict.fromkeys([pl.get("StandardOutPath"), pl.get("StandardErrorPath")]) if p]
+    last_run = max([t for t in (mtime(p) for p in logs) if t] or [None]) if logs else None
+    installed = mtime(path) or 0
+
+    entries = calendar_entries(pl.get("StartCalendarInterval"))
+    interval = pl.get("StartInterval")
+    if entries:
+        schedule = describe_calendar(entries)
+        next_run, due = calendar_time(entries, now), calendar_time(entries, now, forward=False)
+    else:
+        if interval % 3600 == 0:
+            schedule = "every %dh" % (interval // 3600)
+        elif interval % 60 == 0:
+            schedule = "every %dm" % (interval // 60)
+        else:
+            schedule = "every %ds" % interval
+        base = last_run or installed
+        next_run = base + interval if base else None
+        # launchd doesn't catch up missed intervals, and a quiet log says nothing about whether
+        # it ran, so interval jobs are never "missed".
+        due = None
+
+    code = re.match(r"^-?\d+", svc.get("last_exit_code", ""))
+    exit_code = int(code.group(0)) if code else None
+    if not svc.get("loaded"):
+        status = "not loaded"
+    elif svc.get("state") == "running":
+        status = "running"
+    elif exit_code not in (None, 0):
+        status = "failed"
+    elif logs and due and due > installed and now - due > MISSED_GRACE_SECS and (last_run or 0) < due:
+        status = "missed"
+    elif exit_code == 0 or last_run:
+        status = "ok"
+    else:
+        status = "waiting"
+
+    lines = []
+    for p in logs:
+        lines += job_log(p)
+    lines.sort(key=lambda l: l.pop("key"), reverse=True)  # stable: same-key lines stay newest first
+    return {
+        "label": label,
+        "name": label.split(".")[-1],
+        "plist": path,
+        "program": " ".join(pl.get("ProgramArguments") or [pl.get("Program", "")]),
+        "schedule": schedule,
+        "launchd": svc,
+        "status": status,
+        "exit_code": exit_code,
+        "last_run": last_run,
+        "next_run": next_run,
+        "due": due,
+        "log_path": logs[0] if logs else None,
+        "log": lines[:JOB_LOG_LINES],
+    }
+
+
+_jobs_cache = [0, None]
+JOBS_TTL = 10  # seconds; each job costs a launchctl call
+
+
+def jobs_status():
+    if _jobs_cache[1] is not None and time.time() - _jobs_cache[0] < JOBS_TTL:
+        return _jobs_cache[1]
+    now = time.time()
+    out = []
+    for path, pl in scheduled_agents():
+        try:
+            out.append(job_status(path, pl, now))
+        except Exception as e:  # one odd plist shouldn't hide the others
+            out.append({"label": pl.get("Label"), "name": pl.get("Label"), "status": "error", "error": str(e), "log": []})
+    _jobs_cache[:] = [time.time(), out]
+    return out
+
+
 def collect():
     procs = processes()
     dirs = set(glob.glob(os.path.join(HOME, "actions-runner*")) + glob.glob("/Users/*/actions-runner*"))
     roots = sorted(d for d in dirs if os.path.isfile(os.path.join(d, ".runner")))
+    try:
+        jobs = jobs_status()
+    except Exception as e:
+        jobs = [{"label": "jobs", "name": "jobs", "status": "error", "error": str(e), "log": []}]
     return {"now": time.time(), "host": host_status(), "runners": [runner_status(r, procs) for r in roots],
-            "llm": llm_status(procs)}
+            "llm": llm_status(procs), "jobs": jobs}
 
 
 PAGE = r"""<!doctype html>
@@ -517,6 +711,7 @@ code{font:12px ui-monospace,Menlo,monospace;word-break:break-all}
 <header><h1>Mac Dashboard</h1><div class="meta" id="host"></div></header>
 <div id="err"></div>
 <h2>Local LLMs</h2><div class="grid" id="llm"></div>
+<h2 id="jobs-h" hidden>Scheduled jobs</h2><div class="grid" id="jobs"></div>
 <h2>Runners</h2><div class="grid" id="runners"></div>
 </main><script>
 const $=s=>document.querySelector(s);
@@ -598,6 +793,24 @@ function mlxCard(s,now){
     <dt>Last prompt</dt><dd>${lp?`${lp.tokens} tokens · ${ago(lp.time,now)}`:"–"}</dd></dl>
     <h3>Recent requests</h3>${reqTable(s.requests,now,false)}</section>`;
 }
+const JOB_CLASS={ok:"idle",running:"busy",waiting:"",failed:"offline",missed:"offline","not loaded":"offline",error:"offline"};
+function jobCard(j,now){
+  const until=t=>t?(t>now?"in "+dur(t-now):ago(t,now)):"–";
+  const log=j.log&&j.log.length?`<table>${j.log.map(l=>`<tr><td><code>${esc(l.text)}</code></td>
+    <td ${l.time?`title="${esc(when(l.time))}"`:""}>${l.time?ago(l.time,now):""}</td></tr>`).join("")}</table>`
+    :`<div class="empty">Nothing logged yet.</div>`;
+  const svc=j.launchd||{};
+  return `<section class="card"><div class="top"><div><div class="title">${esc(j.name)}</div>
+    <div class="empty">${esc(j.label)}${j.schedule?" · "+esc(j.schedule):""}</div></div>
+    <span class="badge ${JOB_CLASS[j.status]??""}"><span class="dot"></span>${esc(j.status)}</span></div>
+    ${j.error?`<div class="bad">${esc(j.error)}</div>`:""}
+    <dl><dt>Last run</dt><dd title="${esc(when(j.last_run))}">${ago(j.last_run,now)}</dd>
+    <dt>Next run</dt><dd title="${esc(when(j.next_run))}">${until(j.next_run)}</dd>
+    <dt>Last exit</dt><dd class="${j.exit_code?"bad":""}">${j.exit_code==null?"–":j.exit_code}${svc.runs?` · ${esc(svc.runs)} runs since load`:""}</dd>
+    <dt>Program</dt><dd><code>${esc(j.program||"–")}</code></dd>
+    <dt>Log</dt><dd><code>${esc(j.log_path||"–")}</code></dd></dl>
+    <h3>Recent log</h3>${log}</section>`;
+}
 function llmCards(l,now){
   if(!l)return "";
   const mlx=Array.isArray(l.mlx)?l.mlx.map(s=>mlxCard(s,now)).join("")
@@ -610,9 +823,13 @@ async function refresh(){
     $("#host").innerHTML=`<span>${esc(h.hostname)}</span><span>macOS ${esc(h.os)}</span><span>load ${h.load.join(" / ")} (${h.cpus} cpu)</span>
       <span>up ${dur(h.uptime)}</span><span>disk ${h.disk_free_gb} / ${h.disk_total_gb} GB free</span><span>updated ${new Date().toLocaleTimeString()}</span>`;
     $("#llm").innerHTML=llmCards(d.llm,now);
+    const jobs=d.jobs||[];
+    $("#jobs-h").hidden=!jobs.length;
+    $("#jobs").innerHTML=jobs.map(j=>jobCard(j,now)).join("");
     $("#runners").innerHTML=d.runners.length?d.runners.map(r=>card(r,now)).join(""):`<div class="empty">No runners found in /Users/*/actions-runner*</div>`;
     const busy=d.runners.filter(r=>r.status==="busy").length,off=d.runners.filter(r=>r.status==="offline").length;
-    document.title=(off?`⚠ ${off} offline · `:busy?`${busy} busy · `:"")+"Mac Dashboard";
+    const badJobs=jobs.filter(j=>JOB_CLASS[j.status]==="offline").length;
+    document.title=(off?`⚠ ${off} offline · `:badJobs?`⚠ ${badJobs} job${badJobs>1?"s":""} failing · `:busy?`${busy} busy · `:"")+"Mac Dashboard";
     $("#err").textContent="";
   }catch(e){$("#err").textContent="Can't reach the dashboard server: "+e}
 }
