@@ -530,7 +530,10 @@ def describe_calendar(entries):
 
 
 def redact(text):
-    text = text[:MAX_LOG_LINE * 2]  # bounded work per line, before any pattern runs
+    # Bounded work per line, before any pattern runs. Masking shortens text, so drop the fragment
+    # cut at the limit: half a secret is too short to be recognised and could slide into view.
+    if len(text) > MAX_LOG_LINE * 2:
+        text = text[:MAX_LOG_LINE * 2].rsplit(None, 1)[0] + " …"
     text = SECRET_SCHEME.sub(r"\1 ***", text)
     text = SECRET_ASSIGN.sub(r"\1***", text)
     text = SECRET_URL.sub(r"\1***@", text)
