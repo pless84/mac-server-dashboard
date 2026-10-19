@@ -461,6 +461,11 @@ def llm_status(procs):
 # A job counts as having missed its run when nothing has been logged this long after it was due.
 MISSED_GRACE_SECS = 30 * 60
 JOB_LOG_LINES = 5
+# The page is unauthenticated on the LAN, so job details are trimmed: the command is shown by name only
+# (its arguments could hold secrets) and anything in a log line that looks like a secret is masked.
+SECRET_ASSIGN = re.compile(r"(?i)\b([\w-]*(?:pass(?:word)?|secret|token|api[_-]?key|auth)[\w-]*\s*[=:]\s*)\S+")
+SECRET_URL = re.compile(r"(\w+://[^\s:/@]+:)[^\s@]+@")
+LONG_TOKEN = re.compile(r"\b[A-Za-z0-9_\-+/]{32,}={0,2}")
 LOG_TS = re.compile(r"^(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)\s+(.*)$")
 
 
@@ -520,6 +525,21 @@ def describe_calendar(entries):
     return ", ".join(parts)
 
 
+def redact(text):
+    text = SECRET_ASSIGN.sub(r"\1***", text)
+    text = SECRET_URL.sub(r"\1***@", text)
+    return LONG_TOKEN.sub("***", text)
+
+
+def program_name(pl):
+    """The job's program by name, e.g. "bash backup.sh", without the rest of its arguments."""
+    args = pl.get("ProgramArguments") or [pl.get("Program", "")]
+    names = [os.path.basename(str(args[0]))]
+    if len(args) > 1 and not str(args[1]).startswith("-"):
+        names.append(os.path.basename(str(args[1])))
+    return " ".join(names)
+
+
 def job_log(path, limit=JOB_LOG_LINES):
     """The last lines of a job's log, newest first, with their time when the line starts with one.
 
@@ -541,7 +561,7 @@ def job_log(path, limit=JOB_LOG_LINES):
                 ts = None
         if ts:
             last_ts = ts
-        lines.append({"time": ts, "key": ts or last_ts or file_time, "text": (m.group(2) if ts else line)[:240]})
+        lines.append({"time": ts, "key": ts or last_ts or file_time, "text": redact(m.group(2) if ts else line)[:240]})
     return lines[-limit:][::-1]
 
 
@@ -615,7 +635,7 @@ def job_status(path, pl, now):
         "label": label,
         "name": label.split(".")[-1],
         "plist": path,
-        "program": " ".join(pl.get("ProgramArguments") or [pl.get("Program", "")]),
+        "program": program_name(pl),
         "schedule": schedule,
         "launchd": svc,
         "status": status,
@@ -641,7 +661,7 @@ def jobs_status():
         try:
             out.append(job_status(path, pl, now))
         except Exception as e:  # one odd plist shouldn't hide the others
-            out.append({"label": pl.get("Label"), "name": pl.get("Label"), "status": "error", "error": str(e), "log": []})
+            out.append({"label": pl.get("Label"), "name": pl.get("Label"), "status": "error", "error": redact(str(e)), "log": []})
     _jobs_cache[:] = [time.time(), out]
     return out
 

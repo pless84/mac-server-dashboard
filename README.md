@@ -7,7 +7,7 @@ Read-only status page for a Mac used as a home server. It shows:
   (model, memory footprint, prompt cache, recent requests).
 - **Scheduled jobs**: every LaunchAgent in `~/Library/LaunchAgents` with a
   `StartCalendarInterval` or `StartInterval` (e.g. a nightly backup): schedule, last and
-  next run, last exit code and the last lines of its log. A job shows as **failed** when its
+  next run, last exit code and the last lines of its log (the command is shown by name only, and anything in the log that looks like a password, token or key is masked, since the page has no login). A job shows as **failed** when its
   last exit code isn't 0, and as **missed** when nothing was logged within 30 minutes of a
   scheduled run (calendar schedules with a log only). Lines that start with `YYYY-MM-DD HH:MM:SS` get their time shown.
 - **GitHub Actions self-hosted runners** in `/Users/*/actions-runner*`: status,
