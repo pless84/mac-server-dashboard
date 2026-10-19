@@ -463,9 +463,13 @@ MISSED_GRACE_SECS = 30 * 60
 JOB_LOG_LINES = 5
 # The page is unauthenticated on the LAN, so job details are trimmed: the command is shown by name only
 # (its arguments could hold secrets) and anything in a log line that looks like a secret is masked.
-SECRET_ASSIGN = re.compile(r"(?i)\b([\w-]*(?:pass(?:word)?|secret|token|api[_-]?key|auth)[\w-]*\s*[=:]\s*)\S+")
-SECRET_URL = re.compile(r"(\w+://[^\s:/@]+:)[^\s@]+@")
-LONG_TOKEN = re.compile(r"\b[A-Za-z0-9_\-+/]{32,}={0,2}")
+SECRET_ASSIGN = re.compile(
+    r"""(?i)\b([\w-]{0,40}(?:password|passwd|pass|secret|token|api[_-]?key|auth)[\w-]{0,40}["']?\s{0,4}[=:]\s{0,4}["']?)[^\s"']+""")
+SECRET_SCHEME = re.compile(r"(?i)\b(bearer|basic|token)\s+[^\s\"']+")
+SECRET_URL = re.compile(r"(\w{1,20}://[^\s:/@]{0,100}:)[^\s@]{1,200}@")
+LONG_TOKEN = re.compile(r"[A-Za-z0-9_\-+/]{32,}={0,2}")
+SCRIPT_PATH = re.compile(r"^[\w./~-]+\.(sh|bash|zsh|py|rb|pl|js|mjs|php)$")
+MAX_LOG_LINE = 240
 LOG_TS = re.compile(r"^(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)\s+(.*)$")
 
 
@@ -526,6 +530,8 @@ def describe_calendar(entries):
 
 
 def redact(text):
+    text = text[:MAX_LOG_LINE * 2]  # bounded work per line, before any pattern runs
+    text = SECRET_SCHEME.sub(r"\1 ***", text)
     text = SECRET_ASSIGN.sub(r"\1***", text)
     text = SECRET_URL.sub(r"\1***@", text)
     return LONG_TOKEN.sub("***", text)
@@ -535,9 +541,10 @@ def program_name(pl):
     """The job's program by name, e.g. "bash backup.sh", without the rest of its arguments."""
     args = pl.get("ProgramArguments") or [pl.get("Program", "")]
     names = [os.path.basename(str(args[0]))]
-    if len(args) > 1 and not str(args[1]).startswith("-"):
+    # The second argument only when it's plainly a script path, never an option or a value.
+    if len(args) > 1 and SCRIPT_PATH.match(str(args[1])):
         names.append(os.path.basename(str(args[1])))
-    return " ".join(names)
+    return redact(" ".join(names))
 
 
 def job_log(path, limit=JOB_LOG_LINES):
@@ -561,7 +568,7 @@ def job_log(path, limit=JOB_LOG_LINES):
                 ts = None
         if ts:
             last_ts = ts
-        lines.append({"time": ts, "key": ts or last_ts or file_time, "text": redact(m.group(2) if ts else line)[:240]})
+        lines.append({"time": ts, "key": ts or last_ts or file_time, "text": redact(m.group(2) if ts else line)[:MAX_LOG_LINE]})
     return lines[-limit:][::-1]
 
 
